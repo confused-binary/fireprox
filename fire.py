@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-from multiprocessing import Pool
-from pathlib import Path
-import shutil
 import tldextract
 import boto3
-import os
 import sys
 import datetime
-import tzlocal
 import argparse
-import json
-import configparser
-from typing import Tuple, Callable
+from typing import Tuple
+from botocore.exceptions import ClientError, NoRegionError
 
 
 class FireProx(object):
@@ -26,6 +20,7 @@ class FireProx(object):
         self.url = arguments.url
         self.api_list = []
         self.client = None
+        self.session = None
         self.help = help_text
 
         if self.access_key and self.secret_access_key:
@@ -34,9 +29,6 @@ class FireProx(object):
 
         if not self.load_creds():
             self.error('Unable to load AWS credentials')
-
-        if not self.command:
-            self.error('Please provide a valid command')
 
     def __str__(self):
         return 'FireProx()'
@@ -68,59 +60,33 @@ class FireProx(object):
         # If no access_key, secret_key, or profile name provided, try instance credentials
         if not any([self.access_key, self.secret_access_key, self.profile_name]):
             return self._try_instance_profile()
-        # Read in AWS config/credentials files if they exist
-        credentials = configparser.ConfigParser()
-        credentials.read(os.path.expanduser('~/.aws/credentials'))
-        config = configparser.ConfigParser()
-        config.read(os.path.expanduser('~/.aws/config'))
-        # If profile in files, try it, but flow through if it does not work
-        config_profile_section = f'profile {self.profile_name}'
-        if self.profile_name in credentials:
-            if config_profile_section not in config:
-                print(f'Please create a section for {self.profile_name} in your ~/.aws/config file')
-                return False
-            self.region = config[config_profile_section].get('region', 'us-east-1')
-            try:
-                self.client = boto3.session.Session(profile_name=self.profile_name,
-                        region_name=self.region).client('apigateway')
-                self.client.get_account()
-                return True
-            except:
-                pass
-        # Maybe had profile, maybe didn't
-        if self.access_key and self.secret_access_key:
-            try:
-                self.client = boto3.client(
-                    'apigateway',
-                    aws_access_key_id=self.access_key,
-                    aws_secret_access_key=self.secret_access_key,
-                    aws_session_token=self.session_token,
-                    region_name=self.region
-                )
-                self.client.get_account()
-                self.region = self.client._client_config.region_name
-                # Save/overwrite config if profile specified
-                if self.profile_name:
-                    if config_profile_section not in config:
-                        config.add_section(config_profile_section)
-                    config[config_profile_section]['region'] = self.region
-                    with open(os.path.expanduser('~/.aws/config'), 'w') as file:
-                        config.write(file)
-                    if self.profile_name not in credentials:
-                        credentials.add_section(self.profile_name)
-                    credentials[self.profile_name]['aws_access_key_id'] = self.access_key
-                    credentials[self.profile_name]['aws_secret_access_key'] = self.secret_access_key
-                    if self.session_token:
-                        credentials[self.profile_name]['aws_session_token'] = self.session_token
-                    else:
-                        credentials.remove_option(self.profile_name, 'aws_session_token')
-                    with open(os.path.expanduser('~/.aws/credentials'), 'w') as file:
-                        credentials.write(file)
-                return True
-            except:
-                return False
+
+        if self.profile_name:
+            session_details = { 'profile_name': self.profile_name }
+        elif self.access_key and self.secret_access_key:
+            session_details = {
+                'aws_access_key_id': self.access_key,
+                'aws_secret_access_key': self.secret_access_key
+            }
+            if self.session_token:
+                session_details['aws_sessoin_token'] = self.session_token
         else:
+            self.error('Please configure a profile or provice access keys')
             return False
+        
+        # Test provided access keys or profile
+        try:
+            session_details['region_name'] = self.region
+            self.session = boto3.session.Session(**session_details)
+            self.client = self.session.client('apigateway')
+            self.region = self.session.region_name
+            return True
+        except ClientError as error:
+            self.error(error)
+        except NoRegionError as error:
+            self.error(error)
+        return False
+
 
     def error(self, error):
         print(self.help)
@@ -242,12 +208,15 @@ class FireProx(object):
         print(f'Creating => {url}...')
 
         template = self.get_template()
-        response = self.client.import_rest_api(
-            parameters={
-                'endpointConfigurationTypes': 'REGIONAL'
-            },
-            body=template
-        )
+        try:
+            response = self.client.import_rest_api(
+                parameters={
+                    'endpointConfigurationTypes': 'REGIONAL'
+                },
+                body=template
+            )
+        except ClientError as error: 
+            self.error(error)
         resource_id, proxy_url = self.create_deployment(response['id'])
         self.store_api(
             response['id'],
@@ -269,18 +238,21 @@ class FireProx(object):
         resource_id = self.get_resource(api_id)
         if resource_id:
             print(f'Found resource {resource_id} for {api_id}!')
-            response = self.client.update_integration(
-                restApiId=api_id,
-                resourceId=resource_id,
-                httpMethod='ANY',
-                patchOperations=[
-                    {
-                        'op': 'replace',
-                        'path': '/uri',
-                        'value': '{}/{}'.format(url, r'{proxy}'),
-                    },
-                ]
-            )
+            try:
+                response = self.client.update_integration(
+                    restApiId=api_id,
+                    resourceId=resource_id,
+                    httpMethod='ANY',
+                    patchOperations=[
+                        {
+                            'op': 'replace',
+                            'path': '/uri',
+                            'value': '{}/{}'.format(url, r'{proxy}'),
+                        },
+                    ]
+                )
+            except ClientError as error: 
+                self.error(error)
             return response['uri'].replace('/{proxy}', '') == url
         else:
             self.error(f'Unable to update, no valid resource for {api_id}')
@@ -292,14 +264,20 @@ class FireProx(object):
         for item in items:
             item_api_id = item['id']
             if item_api_id == api_id:
-                response = self.client.delete_rest_api(
-                    restApiId=api_id
-                )
+                try:
+                    self.client.delete_rest_api(
+                        restApiId=api_id
+                    )
+                except ClientError as error: 
+                    self.error(error)
                 return True
         return False
 
     def list_api(self, deleted_api_id=None):
-        response = self.client.get_rest_apis()
+        try:
+            response = self.client.get_rest_apis()
+        except ClientError as error: 
+            self.error(error)
         for item in response['items']:
             try:
                 created_dt = item['createdDate']
@@ -324,12 +302,15 @@ class FireProx(object):
         if not api_id:
             self.error('Please provide a valid API ID')
 
-        response = self.client.create_deployment(
-            restApiId=api_id,
-            stageName='fireprox',
-            stageDescription='FireProx Prod',
-            description='FireProx Production Deployment'
-        )
+        try:
+            response = self.client.create_deployment(
+                restApiId=api_id,
+                stageName='fireprox',
+                stageDescription='FireProx Prod',
+                description='FireProx Production Deployment'
+            )
+        except ClientError as error: 
+            self.error(error)
         resource_id = response['id']
         return (resource_id,
                 f'https://{api_id}.execute-api.{self.region}.amazonaws.com/fireprox/')
@@ -337,7 +318,10 @@ class FireProx(object):
     def get_resource(self, api_id):
         if not api_id:
             self.error('Please provide a valid API ID')
-        response = self.client.get_resources(restApiId=api_id)
+        try:
+            response = self.client.get_resources(restApiId=api_id)
+        except ClientError as error: 
+            self.error(error)
         items = response['items']
         for item in items:
             item_id = item['id']
@@ -350,11 +334,14 @@ class FireProx(object):
         if not api_id:
             self.error('Please provide a valid API ID')
         resource_id = self.get_resource(api_id)
-        response = self.client.get_integration(
-            restApiId=api_id,
-            resourceId=resource_id,
-            httpMethod='ANY'
-        )
+        try:
+            response = self.client.get_integration(
+                restApiId=api_id,
+                resourceId=resource_id,
+                httpMethod='ANY'
+            )
+        except ClientError as error: 
+            self.error(error)
         return response['uri']
 
 
@@ -364,21 +351,21 @@ def parse_arguments() -> Tuple[argparse.Namespace, str]:
     :return: Namespace for arguments and help text as a tuple
     """
     parser = argparse.ArgumentParser(description='FireProx API Gateway Manager')
-    parser.add_argument('--profile_name',
-                        help='AWS Profile Name to store/retrieve credentials', type=str, default=None)
-    parser.add_argument('--access_key',
+    parser.add_argument('-p', '--profile_name',
+                        help='AWS Profile Name to retrieve credentials', type=str, default=None)
+    parser.add_argument('-a', '--access_key',
                         help='AWS Access Key', type=str, default=None)
-    parser.add_argument('--secret_access_key',
+    parser.add_argument('-s', '--secret_access_key',
                         help='AWS Secret Access Key', type=str, default=None)
-    parser.add_argument('--session_token',
+    parser.add_argument('-t', '--session_token',
                         help='AWS Session Token', type=str, default=None)
-    parser.add_argument('--region',
-                        help='AWS Region', type=str, default=None)
-    parser.add_argument('--command',
-                        help='Commands: list, create, delete, update', type=str, default=None)
-    parser.add_argument('--api_id',
+    parser.add_argument('-r', '--region',
+                        help='AWS Region', type=str, default='us-east-1')
+    parser.add_argument('-c', '--command',
+                        help='Commands: list, create, delete, update', type=str, default='list')
+    parser.add_argument('-i', '--api_id',
                         help='API ID', type=str, required=False)
-    parser.add_argument('--url',
+    parser.add_argument('-u', '--url',
                         help='URL end-point', type=str, required=False)
     return parser.parse_args(), parser.format_help()
 
@@ -391,7 +378,7 @@ def main():
     args, help_text = parse_arguments()
     fp = FireProx(args, help_text)
     if args.command == 'list':
-        print(f'Listing API\'s...')
+        print(f'Listing {args.region} API\'s...')
         result = fp.list_api()
 
     elif args.command == 'create':
